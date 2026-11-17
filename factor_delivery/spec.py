@@ -39,6 +39,9 @@ class Table:
     columns: List[Column]
     rows: List[Tuple[Any, ...]]
     multiplicities: Optional[List[int]] = None
+    # 可选的显式装载序号（来源身份）。默认按行下标 0..n-1；增量测试的
+    # 独立重算器用它表达撤销后留下的序号空洞（新记录不回收旧 row_seq）。
+    row_seqs: Optional[List[int]] = None
 
     def __post_init__(self) -> None:
         names = [c.name for c in self.columns]
@@ -48,6 +51,13 @@ class Table:
             self.multiplicities = [1] * len(self.rows)
         if len(self.multiplicities) != len(self.rows):
             raise SpecError("multiplicity 行数与数据行数不一致")
+        if self.row_seqs is not None:
+            if len(self.row_seqs) != len(self.rows):
+                raise SpecError("row_seqs 行数与数据行数不一致")
+            if len(set(self.row_seqs)) != len(self.row_seqs) or \
+                    any(not isinstance(s, int) or isinstance(s, bool) or s < 0
+                        for s in self.row_seqs):
+                raise SpecError("row_seqs 必须是互不重复的非负整数")
         for i, mult in enumerate(self.multiplicities):
             if not isinstance(mult, int) or isinstance(mult, bool) or mult <= 0:
                 raise SpecError(f"第 {i} 行 multiplicity 必须是正整数")
@@ -61,6 +71,12 @@ class Table:
 
     def col(self, name: str) -> Column:
         return self._col_by_name[name]
+
+    def seq_of(self, index: int) -> int:
+        """第 index 个数据行的装载序号（来源身份）。"""
+        if self.row_seqs is None:
+            return index
+        return self.row_seqs[index]
 
 
 def _check_value(c: Column, v: Any, ridx: int) -> None:

@@ -155,3 +155,16 @@ class ProvFactory:
             node = PAlt(merged)
             self.alt_intern[key] = node
         return node
+
+
+@dataclass
+class PLazyRef(PNode):
+    """对已持久化来源节点的惰性引用（增量更新种子化干净分区时使用）。
+
+    它不再展开/复用旧 PNode 对象，只记住磁盘 prov_id 与 weight；
+    持久化阶段遇到它直接写回同一个 prov_id，旧来源身份（含未改记录的
+    row_seq）因此原样保留。被引用节点在新版本不可达时由清理逻辑回收。
+    """
+
+    def __init__(self, prov_id: int, weight: int):
+        super().__init__(weight=weight, kind="lazy_ref", prov_id=prov_id)

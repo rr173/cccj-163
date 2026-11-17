@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .spec import Spec
 
-PROTOCOL_VERSION = "1.1"
+PROTOCOL_VERSION = "2.0"
 
 
 class ProtocolError(RuntimeError):
@@ -171,6 +171,39 @@ CREATE TABLE fd_build_stat (
     metric TEXT PRIMARY KEY,
     value  TEXT NOT NULL
 );
+-- 批次更新日志：按 batch_no 去重；content_hash 是批次全部内容的稳定哈希。
+-- status='committed' 的批次重放时：同哈希返回原结果，不同哈希明确拒绝。
+CREATE TABLE fd_batch_log (
+    batch_no     TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('committed')),
+    applied_seq  INTEGER NOT NULL,
+    result_json  TEXT NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE fd_batch_change (
+    batch_no     TEXT NOT NULL,
+    position     INTEGER NOT NULL,
+    table_name   TEXT NOT NULL,
+    op           TEXT NOT NULL CHECK (op IN ('insert', 'retract', 'update')),
+    rid          INTEGER,
+    payload_json TEXT NOT NULL,
+    PRIMARY KEY (batch_no, position)
+);
+-- 构建期子树因子索引：每个 (实例, 父键分区) 记忆化因子对应一个持久化
+-- 因子节点（规范化前子树的根），增量更新时干净分区凭它种子化复用，
+-- 无需重算该分区，也不枚举任何组合。
+CREATE TABLE fd_subtree_factor (
+    alias        TEXT NOT NULL,
+    parent_key   TEXT NOT NULL,
+    node_id      INTEGER NOT NULL,
+    PRIMARY KEY (alias, parent_key)
+);
+-- 各来源表的 row_seq 高水位：新记录序号只增不减，撤销/同值插入都不回收。
+CREATE TABLE fd_seq_watermark (
+    table_name TEXT PRIMARY KEY,
+    next_seq   INTEGER NOT NULL
+);
 """
 
 
@@ -273,19 +306,35 @@ class DeliveryStore:
         return list(self._instance_dtypes[alias])
 
     def source_row_count(self, alias: str) -> int:
-        """实例来源表按装载顺序的总行数（序号空间为 0..n-1）。"""
+        """实例来源表中 *存活* 来源行的数量（撤销行不计；序号空间仍为
+        0..高水位-1，已撤销序号在审计查询中返回 None）。"""
         assert self._instances is not None
         if alias not in self._instances:
             raise ProtocolError(f"未知表实例 {alias!r}")
         phys = self.src_physical(self._instances[alias])
         return self.conn.execute(
-            f"SELECT COUNT(*) FROM {phys}"
+            f"SELECT COUNT(*) FROM {phys} WHERE live=1"
         ).fetchone()[0]
 
-    def fetch_source_row(self, alias: str, row_seq: int) -> Optional[Dict[str, Any]]:
-        """按装载序号取一条来源行（含 mult 与各列值，bool 已还原为 Python bool）。
+    def row_seq_high_watermark(self, alias: str) -> int:
+        """实例来源表的 row_seq 高水位（含已撤销记录，只增不减）。
 
-        序号越界返回 None，便于审计者直接核对 fd_prov_src 里登记的来源。
+        合法序号空间为 0..高水位-1；其中部分序号可能对应已撤销记录。
+        """
+        assert self._instances is not None
+        if alias not in self._instances:
+            raise ProtocolError(f"未知表实例 {alias!r}")
+        phys = self.src_physical(self._instances[alias])
+        row = self.conn.execute(
+            f"SELECT COALESCE(MAX(row_seq) + 1, 0) FROM {phys}"
+        ).fetchone()
+        return row[0]
+
+    def fetch_source_row(self, alias: str, row_seq: int) -> Optional[Dict[str, Any]]:
+        """按装载序号取一条 *存活* 来源行（含 mult 与各列值，bool 已还原）。
+
+        序号越界或该序号对应记录已被撤销时返回 None，便于审计者直接核对
+        fd_prov_src 里登记的来源（新版本的来源表达不会再引用撤销行）。
         """
         assert self._instances is not None and self._instance_dtypes is not None
         if alias not in self._instances:
@@ -296,7 +345,8 @@ class DeliveryStore:
         phys = self.src_physical(self._instances[alias])
         select = ", ".join(["row_seq", "mult"] + [f"p{i}" for i in range(len(cols))])
         row = self.conn.execute(
-            f"SELECT {select} FROM {phys} WHERE row_seq=?", (row_seq,)
+            f"SELECT {select} FROM {phys} WHERE row_seq=? AND live=1",
+            (row_seq,),
         ).fetchone()
         if row is None:
             return None
@@ -323,6 +373,7 @@ class DeliveryStore:
         c.execute("INSERT INTO fd_meta VALUES ('protocol_version', ?)",
                   (PROTOCOL_VERSION,))
         c.execute("INSERT INTO fd_meta VALUES ('spec_name', ?)", (spec.name,))
+        c.execute("INSERT INTO fd_meta VALUES ('current_version', ?)", ("0",))
 
         # 来源表与列
         for ti, (tname, tbl) in enumerate(spec.tables.items()):
@@ -337,17 +388,27 @@ class DeliveryStore:
             col_defs = ", ".join(
                 f"p{pos} {_sqlite_type(col.dtype)}" for pos, col in enumerate(tbl.columns)
             )
-            # row_seq：来源行装载序号（从 0 起），来源追溯以此命名来源行
+            # row_seq：来源行装载序号（从 0 起），来源追溯以此命名来源行。
+            # rid：稳定记录身份，主键；live=0 是已撤销记录（保留身份历史，
+            # 不再参与任何版本的查询）。初始装载 rid 与 row_seq 相同。
             c.execute(
-                f"CREATE TABLE {phys} (row_seq INTEGER NOT NULL, {col_defs}, "
-                "mult INTEGER NOT NULL, PRIMARY KEY (row_seq))"
+                f"CREATE TABLE {phys} (rid INTEGER NOT NULL, "
+                "row_seq INTEGER NOT NULL, live INTEGER NOT NULL DEFAULT 1, "
+                f"{col_defs}, mult INTEGER NOT NULL, PRIMARY KEY (rid))"
             )
-            params = [(i, *row, mult) for i, (row, mult) in
+            c.execute(
+                f"CREATE UNIQUE INDEX idx_{phys}_rowseq ON {phys}(row_seq)"
+            )
+            params = [(i, i, 1, *row, mult) for i, (row, mult) in
                       enumerate(zip(tbl.rows, tbl.multiplicities))]
             c.executemany(
                 f"INSERT INTO {phys} VALUES "
-                f"({','.join('?' * (len(tbl.columns) + 2))})",
+                f"({','.join('?' * (len(tbl.columns) + 4))})",
                 params,
+            )
+            c.execute(
+                "INSERT INTO fd_seq_watermark VALUES (?, ?)",
+                (tname, len(tbl.rows)),
             )
 
         # 实例与实例列
@@ -404,6 +465,17 @@ class DeliveryStore:
         )
         return phys
 
+    def drop_reduction_tables(self) -> None:
+        """删除全部约减表及其索引（增量更新开始时清理上一版本中间结果）。"""
+        for alias in self.instances:
+            phys = self.red_physical(alias)
+            for (idx_name,) in self.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND tbl_name=?", (phys,)
+            ).fetchall():
+                self.conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+            self.conn.execute(f"DROP TABLE IF EXISTS {phys}")
+
     def drop_factor_tables(self) -> None:
         self.conn.execute("DELETE FROM fd_node")
         self.conn.execute("DELETE FROM fd_group_entry")
@@ -411,6 +483,7 @@ class DeliveryStore:
         self.conn.execute("DELETE FROM fd_prov_node")
         self.conn.execute("DELETE FROM fd_prov_src")
         self.conn.execute("DELETE FROM fd_prov_comp")
+        self.conn.execute("DELETE FROM fd_subtree_factor")
         self.conn.execute("DELETE FROM fd_build_stat")
 
     def write_build_stat(self, metric: str, value: Any) -> None:
@@ -423,6 +496,144 @@ class DeliveryStore:
     def read_build_stats(self) -> Dict[str, str]:
         cur = self.conn.execute("SELECT metric, value FROM fd_build_stat")
         return dict(cur.fetchall())
+
+    # ------------------------------------------------------------------ #
+    # 批次更新支持
+    # ------------------------------------------------------------------ #
+    def lookup_batch(self, batch_no: str) -> Optional[tuple]:
+        """已提交批次 -> (content_hash, applied_seq, result_json)；未见返回 None。"""
+        row = self.conn.execute(
+            "SELECT content_hash, applied_seq, result_json FROM fd_batch_log "
+            "WHERE batch_no=?",
+            (batch_no,),
+        ).fetchone()
+        return None if row is None else tuple(row)
+
+    def record_batch(self, batch_no: str, content_hash: str,
+                     applied_seq: int, result_json: str,
+                     changes: List[Tuple[int, str, str, Any, str]]) -> None:
+        """在当前事务内登记批次日志与逐变更明细。
+
+        changes: [(position, table_name, op, rid, payload_json), ...]
+        """
+        self.conn.execute(
+            "INSERT INTO fd_batch_log (batch_no, content_hash, status, "
+            "applied_seq, result_json) VALUES (?, ?, 'committed', ?, ?)",
+            (batch_no, content_hash, applied_seq, result_json),
+        )
+        self.conn.executemany(
+            "INSERT INTO fd_batch_change (batch_no, position, table_name, op, "
+            "rid, payload_json) VALUES (?, ?, ?, ?, ?, ?)",
+            [(batch_no, pos, tname, op, rid, payload)
+             for pos, tname, op, rid, payload in changes],
+        )
+
+    def list_batches(self) -> List[Dict[str, Any]]:
+        """按应用顺序列出全部已提交批次（重开后仍可审计批次去重信息）。"""
+        cur = self.conn.execute(
+            "SELECT batch_no, content_hash, applied_seq, result_json, created_at "
+            "FROM fd_batch_log ORDER BY applied_seq"
+        )
+        return [
+            {"batch_no": b, "content_hash": h, "applied_seq": s,
+             "result_json": rj, "created_at": ts}
+            for b, h, s, rj, ts in cur.fetchall()
+        ]
+
+    def next_row_seq(self, table_name: str, n: int) -> int:
+        """在当前事务内领取 n 个连续 row_seq，返回起始序号并推进高水位。"""
+        row = self.conn.execute(
+            "SELECT next_seq FROM fd_seq_watermark WHERE table_name=?",
+            (table_name,),
+        ).fetchone()
+        if row is None:
+            raise ProtocolError(f"未知来源表 {table_name!r}")
+        start = row[0]
+        self.conn.execute(
+            "UPDATE fd_seq_watermark SET next_seq=? WHERE table_name=?",
+            (start + n, table_name),
+        )
+        return start
+
+    def insert_source_record(self, table_name: str, rid: int, row_seq: int,
+                             values: Sequence[Any], mult: int) -> None:
+        ncols = self.source_column_count(table_name)
+        self.conn.execute(
+            f"INSERT INTO {self.src_physical(table_name)} "
+            f"(rid, row_seq, live, {', '.join(f'p{i}' for i in range(ncols))}, "
+            "mult) VALUES (" + ",".join("?" * (ncols + 4)) + ")",
+            (rid, row_seq, 1, *values, mult),
+        )
+
+    def mark_source_retracted(self, table_name: str, rid: int) -> None:
+        self.conn.execute(
+            f"UPDATE {self.src_physical(table_name)} SET live=0 WHERE rid=?",
+            (rid,),
+        )
+
+    def source_column_count(self, table_name: str) -> int:
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM fd_source_column WHERE table_name=?",
+            (table_name,),
+        ).fetchone()
+        return row[0]
+
+    def source_table_names(self) -> List[str]:
+        return [r[0] for r in self.conn.execute(
+            "SELECT table_name FROM fd_source_table ORDER BY table_name"
+        ).fetchall()]
+
+    def next_rid(self, table_name: str) -> int:
+        """新记录身份：现有 rid 最大值 + 1（撤销记录的 rid 永不复用）。"""
+        row = self.conn.execute(
+            f"SELECT COALESCE(MAX(rid), -1) + 1 FROM "
+            f"{self.src_physical(table_name)}"
+        ).fetchone()
+        return row[0]
+
+    def find_live_rid(self, table_name: str, rid: int) -> Optional[int]:
+        row = self.conn.execute(
+            f"SELECT rid FROM {self.src_physical(table_name)} "
+            "WHERE rid=? AND live=1",
+            (rid,),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def clear_subtree_factors(self) -> None:
+        self.conn.execute("DELETE FROM fd_subtree_factor")
+
+    def write_subtree_factor(self, alias: str,
+                             parent_key: Tuple[Any, ...], node_id: int) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO fd_subtree_factor VALUES (?, ?, ?)",
+            (alias, _key_text(parent_key), node_id),
+        )
+
+    def read_subtree_factor_id(self, alias: str,
+                               parent_key: Tuple[Any, ...]) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT node_id FROM fd_subtree_factor WHERE alias=? AND parent_key=?",
+            (alias, _key_text(parent_key)),
+        ).fetchone()
+        return None if row is None else row[0]
+
+    def current_applied_seq(self) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(applied_seq), 0) FROM fd_batch_log"
+        ).fetchone()
+        return row[0]
+
+    def factor_node_high_watermark(self) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(node_id), 0) FROM fd_node"
+        ).fetchone()
+        return row[0]
+
+    def prov_high_watermark(self) -> int:
+        row = self.conn.execute(
+            "SELECT COALESCE(MAX(prov_id), 0) FROM fd_prov_node"
+        ).fetchone()
+        return row[0]
 
     def file_size_bytes(self) -> int:
         self.conn.commit()
@@ -445,3 +656,18 @@ def _ident(name: str) -> str:
         else:
             out.append(f"_{ord(ch):x}_")
     return "".join(out)
+
+
+def _key_text(key: Sequence[Any]) -> str:
+    """父键分区的稳定文本编码（类型感知，bool 与 int 不混淆）。"""
+    parts = []
+    for v in key:
+        if v is None:
+            parts.append("n")
+        if isinstance(v, bool):
+            parts.append(f"b:{int(v)}")
+        elif isinstance(v, int):
+            parts.append(f"i:{v}")
+        else:
+            parts.append("s:" + str(v).replace("\\", "\\\\"))
+    return "|".join(parts)

@@ -111,7 +111,9 @@ def main():
                       "node_empty", "node_union")
                      if k in stats)
     assert phys_widest < logical_rows // 1000, "存在接近逻辑输出规模的物理表"
-    assert phys_total < logical_rows // 1000, "物理总行数异常，疑似物化宽连接"
+    # 物理总行数随源表/键分组线性（含协议 2.0 的来源 src 行与子树因子索引），
+    # 与 4 亿组合仍相差三个数量级，阈值放宽到 logical//500 以容纳线性常数。
+    assert phys_total < logical_rows // 500, "物理总行数异常，疑似物化宽连接"
     assert node_total < logical_rows // 1000, "因子节点数异常，疑似展开组合"
     # 不存在任何一张表有 4 亿行；最大表也只在源表行数 + 因子 entry 的量级
     assert phys_widest <= (NL + NR) * 2 + 100

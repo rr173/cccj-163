@@ -147,7 +147,9 @@ class LineageExpression:
             )
         if not isinstance(row_seq, int) or isinstance(row_seq, bool) or row_seq < 0:
             raise QueryError("row_seq 必须是非负整数")
-        if row_seq >= self._session.store.source_row_count(alias):
+        # 越界按 row_seq 高水位判断（含已撤销记录的序号空洞），不能用
+        # 存活行数：撤销后新记录的合法序号可能大于存活行数。
+        if row_seq >= self._session.store.row_seq_high_watermark(alias):
             return False
         if self.root is None:
             return False

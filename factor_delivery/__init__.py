@@ -15,6 +15,10 @@ from .builder import build_factorized, BuildError
 from .store import DeliveryStore, ProtocolError
 from .query import QuerySession, Condition, QueryError
 from .lineage import LineageExpression, LineageNode, lineage_of
+from .batch import (
+    ChangeSet, BatchChange, BatchResult, BatchError, BatchConflictError,
+    IncrementalEngine, RuntimeSpec, apply_batch,
+)
 from .reference import (
     brute_force_join, brute_force_count, brute_force_page, brute_force_filtered,
     brute_force_lineage, lineage_participating_rows,
@@ -36,6 +40,14 @@ __all__ = [
     "LineageExpression",
     "LineageNode",
     "lineage_of",
+    "ChangeSet",
+    "BatchChange",
+    "BatchResult",
+    "BatchError",
+    "BatchConflictError",
+    "IncrementalEngine",
+    "RuntimeSpec",
+    "apply_batch",
     "brute_force_join",
     "brute_force_count",
     "brute_force_page",

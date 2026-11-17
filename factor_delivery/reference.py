@@ -177,13 +177,14 @@ def brute_force_lineage(spec: Spec) -> Dict[
             stack.append(v)
             order.append(v)
 
-    # 每个实例的 (取值元组, 装载序号, multiplicity)；序号即 Table.rows 的下标
+    # 每个实例的 (取值元组, 装载序号, multiplicity)；序号取 Table.seq_of，
+    # 默认即行下标，带显式 row_seqs 时可表达撤销后的序号空洞。
     rows_of: Dict[str, List[Tuple[Tuple[Any, ...], int, int]]] = {}
     attr_pos: Dict[str, Dict[str, int]] = {}
     for alias, tname in spec.instances.items():
         tbl = spec.tables[tname]
         rows_of[alias] = [
-            (tuple(r), seq, mult)
+            (tuple(r), tbl.seq_of(seq), mult)
             for seq, (r, mult) in enumerate(zip(tbl.rows, tbl.multiplicities))
         ]
         attr_pos[alias] = {col.attr: i for i, col in enumerate(tbl.columns)}

@@ -146,7 +146,18 @@ class TestDeliveryFile(unittest.TestCase):
         ver = conn.execute(
             "SELECT value FROM fd_meta WHERE key='protocol_version'"
         ).fetchone()[0]
-        self.assertEqual(ver, "1.1")
+        self.assertEqual(ver, "2.0")
+        # 增量更新协议表齐备
+        has_batch = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name='fd_batch_log'"
+        ).fetchone()[0]
+        self.assertTrue(has_batch)
+        has_subtree = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name='fd_subtree_factor'"
+        ).fetchone()[0]
+        self.assertTrue(has_subtree)
         # 来源追溯协议表齐备且引用完整
         prov_kinds = {r[0] for r in conn.execute(
             "SELECT DISTINCT kind FROM fd_prov_node")}

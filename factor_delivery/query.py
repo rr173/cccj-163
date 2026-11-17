@@ -135,8 +135,9 @@ def _coalesce_nodes(session: "QuerySession", branches: List["RNode"],
         if any(n.kind != "product" for n in unwrapped):
             return _coalesce_nodes(session, unwrapped, scope)
         # 关键：(a×b) ∪ (c×d) ≠ (a∪c)×(b∪d)。袋并不能下沉到 product
-        # 内部按分支位置重新乘积，否则凭空造出跨父键组合。这里保留每个
-        # product 为独立袋并分支，构造虚拟 union，寻址时按全序多路归并。
+        # 内部按分支位置重新乘积（restrict 下推时各分支存活情况不同，
+        # 重乘会凭空造出跨父键组合）。保留每个 product 为独立袋并分支，
+        # 构造虚拟 union，寻址时按全序做带局部秩映射的多路归并。
         return _VirtualUnion(session, scope, unwrapped)
     # group/product 异构（理论上规范化后不应出现）
     raise ProtocolError(f"无法归并异构袋并分支: {kinds}")
@@ -320,23 +321,76 @@ class RNode:
                 skipped += w
             raise QueryError(f"秩 {r} 超出 group 节点范围")
         if self.kind == "product":
-            # 混合进制：低位分支在最后；先反向算出每个分支的局部秩，
-            # 再按分支（即输出列）正向顺序写值，保证列序正确
-            qs: List[int] = []
-            stride = 1
-            for cid in reversed(self._child_ids):  # type: ignore[union-attr]
-                child = self.session.get_node(cid)
-                qs.append((r // stride) % child.weight)
-                stride *= child.weight
-            qs.reverse()
-            for cid, q in zip(self._child_ids, qs):  # type: ignore[arg-type]
-                self.session.get_node(cid).row_at(q, out)
+            # 条件独立分支的笛卡尔积，按分支（输出列）顺序定全序。
+            # 不能假设各分支等宽：group 分支可能把来源行 multiplicity
+            # 折叠进 entry 叶子，使「不同取值数」与分支 weight 不等。
+            # 改用 entry 宽度感知寻址：从最右分支起，每条左分支 entry 的
+            # 步长 = 该 entry 子权重 × 右侧全部兄弟的总重数。
+            self._product_row_at(r, out)
             return
         if self.kind == "union":
             # 袋并：惰性归并为按全序等价的因子后寻址（见 coalesce）
             self.coalesce().row_at(r, out)
             return
         raise ProtocolError(f"未知节点类型 {self.kind}")
+
+    def _product_row_at(self, r: int, out: List[Any]) -> None:
+        """entry 宽度感知的 product 秩寻址，与参考袋的全序严格一致。
+
+        全局展开等价于嵌套循环：沿输出列从左到右选 entry，每个完整取值
+        组合再按其重数（沿途各 entry 子权重之积）连续重复。递归传递
+        「左侧已选 entry 的子权重累积 left_mult」：
+
+        * 当前 group 分支某 entry（子权重 w）的块宽 = w × left_mult × 右侧总重；
+        * 进入 entry 后，右侧兄弟的 entry 切换周期变为 left_mult × w；
+        * 最右分支定位到 entry 后，剩余偏移即该元组的 multiplicity 重复，
+          leaf 不产生输出列，重复不改变写值。
+        """
+        self._ensure()
+        child_ids = self._child_ids  # type: ignore[assignment]
+        self._address_product(0, r, 1, out)
+
+    def _address_product(self, idx: int, r: int,
+                         left_mult: int, out: List[Any]) -> None:
+        child_ids = self._child_ids  # type: ignore[union-attr]
+        node = self.session.get_node(child_ids[idx])
+        last = idx == len(child_ids) - 1
+        right_w = self._suffix_weight(idx + 1)
+        if node.kind == "group":
+            node._ensure()
+            for value, cid in node._entries:  # type: ignore[union-attr]
+                child = self.session.get_node(cid)
+                block = child.weight * left_mult * right_w
+                if r < block:
+                    out.append(value)
+                    new_left = left_mult * child.weight
+                    # 块内偏移直接作为右侧分支视角的秩：右层 entry 的全局
+                    # 块宽天然含 left_mult 周期，由右层自行按块定位。
+                    within = r % (child.weight * right_w)
+                    child.row_at(within // right_w, out)  # leaf，无输出列
+                    if not last:
+                        self._address_product(idx + 1, within, new_left, out)
+                    return
+                r -= block
+            raise QueryError(f"product group 分支 {idx} 秩越界")
+        # 非 group 分支（leaf / 嵌套 product）：整体一块
+        block = node.weight * left_mult * right_w
+        if r < block:
+            new_left = left_mult * node.weight
+            within = r % (node.weight * right_w)
+            node.row_at(within // right_w, out)
+            if not last:
+                self._address_product(idx + 1, within, new_left, out)
+            return
+        raise QueryError(f"product 分支 {idx} 秩越界")
+
+    def _suffix_weight(self, start: int) -> int:
+        """从分支 start 起所有右侧兄弟的总重数之积（空区间为 1）。"""
+        child_ids = self._child_ids  # type: ignore[union-attr]
+        total = 1
+        for j in range(start, len(child_ids)):
+            total *= self.session.get_node(child_ids[j]).weight
+        return total
 
     # ---------------- 袋并归并 ---------------- #
     def coalesce(self) -> "RNode":
@@ -562,15 +616,46 @@ class RProductVirtual(RNode):
         return total
 
     def row_at(self, r: int, out: List[Any]) -> None:
-        # 与基础 product 一致：反向算各分支局部秩，再按分支正向写值
-        qs: List[int] = []
-        stride = 1
-        for child in reversed(self._vchildren):
-            qs.append((r // stride) % child.weight)
-            stride *= child.weight
-        qs.reverse()
-        for child, q in zip(self._vchildren, qs):
-            child.row_at(q, out)
+        # 与磁盘 product 同一套 entry 宽度感知寻址（group 分支可能折叠了
+        # 来源 multiplicity，不能用规整混合进制）。递归传递左侧累积 mult。
+        children = self._vchildren
+
+        def suffix_w(start: int) -> int:
+            total = 1
+            for j in range(start, len(children)):
+                total *= children[j].weight
+            return total
+
+        def address(idx: int, rank: int, left_mult: int) -> None:
+            node = children[idx]
+            last = idx == len(children) - 1
+            right_w = suffix_w(idx + 1)
+            entries = _iter_group_entries(self.session, node) \
+                if node.kind == "group" else None
+            if entries is not None:
+                for value, child in entries:
+                    block = child.weight * left_mult * right_w
+                    if rank < block:
+                        out.append(value)
+                        new_left = left_mult * child.weight
+                        within = rank % (child.weight * right_w)
+                        child.row_at(within // right_w, out)
+                        if not last:
+                            address(idx + 1, within, new_left)
+                        return
+                    rank -= block
+                raise QueryError("虚拟 product group 分支秩越界")
+            block = node.weight * left_mult * right_w
+            if rank < block:
+                new_left = left_mult * node.weight
+                within = rank % (node.weight * right_w)
+                node.row_at(within // right_w, out)
+                if not last:
+                    address(idx + 1, within, new_left)
+                return
+            raise QueryError("虚拟 product 分支秩越界")
+
+        address(0, r, 1)
 
     def restrict(self, conditions: Dict[str, Condition]) -> RNode:
         if not conditions:
@@ -631,40 +716,38 @@ class _VirtualUnion(RNode):
         return sum(b.weight for b in self._vbranches)
 
     def row_at(self, r: int, out: List[Any]) -> None:
-        # 递归把袋并解析为 (最外层取值 -> 袋并子因子) 的有序映射后寻址
-        merged = self._merged_top()
-        skipped = 0
-        for value, sub in merged:
-            w = sub.weight
-            if r < skipped + w:
-                out.append(value)
-                sub.row_at(r - skipped, out)
-                return
-            skipped += w
-        raise QueryError(f"秩 {r} 超出虚拟袋并范围")
-
-    def _merged_top(self) -> List[Tuple[Any, RNode]]:
-        """按输出首列合并各分支的 entry，同值子因子再袋并。
-
-        分支最外层可能是 group（单因子）或 product（首分支承载输出首列）。
-        统一取出「首列分组 + 剩余因子」再按首列取值袋并。
-        """
+        # 按输出首列把各分支拆成 (首列值, 剩余因子)，同值归入一个桶。
+        # 桶内保留 *每个分支各自的剩余因子*，全局秩按分支顺序在桶内定位，
+        # 命中后换算成该分支的局部秩再寻址——绝不把不同分支的剩余因子
+        # 合并成一个乘积，避免跨父键交叉。
         attr = self.scope[0]
+        value_order: List[Any] = []
         buckets: Dict[Tuple[str, Any], List[RNode]] = {}
-        value_of: Dict[Tuple[str, Any], Any] = {}
         for br in self._vbranches:
             for value, tail in _split_first_column(self.session, br):
                 k = _value_identity(value)
-                buckets.setdefault(k, []).append(tail)
-                value_of[k] = value
-        sub_scope = tuple(a for a in self.scope if a != attr)
-        entries: List[Tuple[Any, RNode]] = []
-        for k, subs in buckets.items():
-            entries.append((value_of[k],
-                            _coalesce_nodes(self.session, subs, sub_scope)))
-        entries.sort(key=lambda item:
-                     self.session.store_value_key(attr, item[0]))
-        return entries
+                if k not in buckets:
+                    buckets[k] = []
+                    value_order.append(value)
+                buckets[k].append(tail)
+        value_order.sort(
+            key=lambda v: self.session.store_value_key(attr, v)
+        )
+        skipped = 0
+        for value in value_order:
+            tails = buckets[_value_identity(value)]
+            bucket_w = sum(t.weight for t in tails)
+            if r < skipped + bucket_w:
+                out.append(value)
+                local = r - skipped
+                for tail in tails:
+                    if local < tail.weight:
+                        tail.row_at(local, out)
+                        return
+                    local -= tail.weight
+                raise QueryError("虚拟袋并桶内局部秩越界")
+            skipped += bucket_w
+        raise QueryError(f"秩 {r} 超出虚拟袋并范围")
 
     def restrict(self, conditions: Dict[str, Condition]) -> RNode:
         restricted = [b.restrict(conditions) for b in self._vbranches]

@@ -39,6 +39,9 @@ class BNode:
     # 来源闭包：该因子所有逻辑行的来源表达。empty 节点为 None；
     # 非空节点在最终闭包计算时由 ProvFactory 驻留赋值。
     prov: Optional[PNode] = None
+    # 增量更新种子化节点：非 None 时持久化直接复用该旧 node_id，
+    # 不重写节点及其整棵子树（干净分区的压缩节点保持原样）。
+    persisted_id: Optional[int] = None
 
 
 @dataclass
@@ -554,6 +557,9 @@ class _Builder:
         }
         self._orient_tree()
         self.memo: Dict[Tuple[str, Tuple[Any, ...]], BNode] = {}
+        # 每个 (实例, 父键) 记忆化子树因子的根（规范化前），持久化时登记到
+        # fd_subtree_factor，供增量更新按分区种子化复用。
+        self.subtree_roots: List[Tuple[str, Optional[Tuple[Any, ...]], BNode]] = []
         self.node_ids: Dict[int, int] = {}
         self.kind_counts = {"group": 0, "product": 0, "leaf": 0,
                            "empty": 0, "union": 0}
@@ -612,14 +618,8 @@ class _Builder:
         return root
 
     # ---------------- 来源闭包 ---------------- #
-    def attach_provenance(self, root: BNode) -> None:
-        """规范化完成后，为整棵因子 DAG 计算并驻留来源闭包。
-
-        叶子的来源在 Trie 装配时已带；复合节点的闭包按结构合成：
-        group/union -> 各孩子 alt（袋并相加），product -> 各孩子 prod（相乘）。
-        全程只遍历因子节点，不枚举任何来源组合。合成后逐节点核对
-        来源 weight 与因子 weight 必须相等。
-        """
+    def make_closure(self):
+        """构造来源闭包计算器（规范化完成后对根及各子树因子分别调用）。"""
         def closure(node: BNode) -> Optional[PNode]:
             if node.kind == "empty":
                 node.prov = None
@@ -637,9 +637,13 @@ class _Builder:
             if node.kind == "leaf":
                 raise BuildError("非空叶子缺少来源表达")
             if node.kind == "group":
-                child_provs = [closure(c) for _, c in node.entries]
-                if any(p is None for p in child_provs):
-                    raise BuildError("group 存在无来源表达的非空孩子")
+                # 空分区孩子没有来源闭包（增量重建后部分键分区可能变空），
+                # 袋并只聚合非空孩子。
+                child_provs = [p for _, c in node.entries
+                               if (p := closure(c)) is not None]
+                if not child_provs:
+                    node.prov = None
+                    return None
                 prov = self.factory.alt(child_provs)  # type: ignore[arg-type]
             elif node.kind == "union":
                 child_provs = [closure(c) for c in node.children]
@@ -660,9 +664,24 @@ class _Builder:
                 )
             node.prov = prov
             return prov
+        return closure
 
+    def attach_provenance(self, root: BNode) -> None:
+        """规范化完成后，为整棵因子 DAG 计算并驻留来源闭包。
+
+        叶子的来源在 Trie 装配时已带；复合节点的闭包按结构合成：
+        group/union -> 各孩子 alt（袋并相加），product -> 各孩子 prod（相乘）。
+        全程只遍历因子节点，不枚举任何来源组合。合成后逐节点核对
+        来源 weight 与因子 weight 必须相等。
+        """
+        closure = self.make_closure()
         if root.kind != "empty":
             closure(root)
+        # 每个记忆化子树因子也独立闭包：它们需要可独立持久化，供增量
+        # 更新按分区种子化复用（已带闭包的直接跳过）。
+        for _alias, _key, sub in self.subtree_roots:
+            if sub.kind != "empty" and sub.prov is None:
+                closure(sub)
 
     def _create_reduction_tables(self) -> None:
         for alias, tname in self.spec.instances.items():
@@ -671,10 +690,11 @@ class _Builder:
             red = self.store.create_reduction_table(alias, ncols)
             src = self.store.src_physical(tname)
             cols = ", ".join(f"p{i}" for i in range(ncols))
-            # 连同 row_seq 一起复制：约减只删行，装载序号保持不变
+            # 连同 row_seq 一起复制：约减只删行，装载序号保持不变。
+            # 增量版本的源表带 live 标记，只复制存活记录（撤销行不参与）。
             self.c.execute(
                 f"INSERT INTO {red} (row_seq, {cols}, mult) "
-                f"SELECT row_seq, {cols}, mult FROM {src}"
+                f"SELECT row_seq, {cols}, mult FROM {src} WHERE live=1"
             )
             cur = self.c.execute(f"SELECT COUNT(*) FROM {src}")
             n = cur.fetchone()[0]
@@ -900,6 +920,10 @@ class _Builder:
 
         if parent_key is not None:
             self.memo[(alias, parent_key)] = result
+            # 只登记按父键分区的记忆化子树因子；根实例（parent_key=None）
+            # 是整棵树的未规范化根，不能进分区索引——它与最终规范化真根
+            # 重复，登记进去会让 prune 保留一棵结构不一致的旧根。
+            self.subtree_roots.append((alias, parent_key, result))
         return result
 
     def _scope_sorted(self, scope: Tuple[str, ...]) -> Tuple[str, ...]:
@@ -940,39 +964,61 @@ class _Builder:
         raise BuildError(f"未知节点类型 {node.kind}")
 
     # ---------------- 持久化 ---------------- #
-    def persist(self, root: BNode) -> int:
-        self.store.drop_factor_tables()
+    def persist(self, root: BNode, incremental: bool = False) -> int:
+        if not incremental:
+            self.store.drop_factor_tables()
         self._prov_ids: Dict[int, int] = {}
+        # 增量更新可传入高水位起始 id；全量构建从 1 开始
+        self._next_node_id = getattr(self, "node_id_start", 1)
+        self._next_prov_id = getattr(self, "prov_id_start", 1)
         root_id = self._write_node(root)
-        self.store.write_build_stat("node_group", self.kind_counts["group"])
-        self.store.write_build_stat("node_product", self.kind_counts["product"])
-        self.store.write_build_stat("node_union", self.kind_counts["union"])
-        self.store.write_build_stat("node_leaf", self.kind_counts["leaf"])
-        self.store.write_build_stat("node_empty", self.kind_counts["empty"])
-        self.store.write_build_stat("group_entries", self.group_entry_count)
-        self.store.write_build_stat("product_children", self.product_child_count)
-        self.store.write_build_stat("prov_src", self.prov_counts["src"])
-        self.store.write_build_stat("prov_prod", self.prov_counts["prod"])
-        self.store.write_build_stat("prov_alt", self.prov_counts["alt"])
-        self.store.write_build_stat("prov_src_rows", self.prov_src_rows)
-        self.store.write_build_stat("prov_comp_rows", self.prov_comp_rows)
-        self.store.write_build_stat("source_rows_total", self.source_rows)
-        for alias, n in self.reduced_rows.items():
-            self.store.write_build_stat(f"reduced_rows:{alias}", n)
-        self.store.write_build_stat("max_physical_table_rows",
-                                    self.max_physical_rows)
-        self.store.write_build_stat("distinct_subtree_factors", len(self.memo) + 1)
-        self.c.execute(
-            "INSERT INTO fd_meta VALUES ('root_node_id', ?)", (str(root_id),)
-        )
+        # 记忆化子树因子全部持久化并登记分区索引（增量更新的种子接缝）。
+        # 增量模式下索引先清空再重写：种子分区写回旧 id，脏分区写新 id。
+        if incremental:
+            self.store.clear_subtree_factors()
+        for alias, pkey, sub in self.subtree_roots:
+            nid = self._write_node(sub)
+            self.store.write_subtree_factor(
+                alias, pkey if pkey is not None else (), nid
+            )
+        if not incremental:
+            self.store.write_build_stat("node_group", self.kind_counts["group"])
+            self.store.write_build_stat("node_product", self.kind_counts["product"])
+            self.store.write_build_stat("node_union", self.kind_counts["union"])
+            self.store.write_build_stat("node_leaf", self.kind_counts["leaf"])
+            self.store.write_build_stat("node_empty", self.kind_counts["empty"])
+            self.store.write_build_stat("group_entries", self.group_entry_count)
+            self.store.write_build_stat("product_children",
+                                        self.product_child_count)
+            self.store.write_build_stat("prov_src", self.prov_counts["src"])
+            self.store.write_build_stat("prov_prod", self.prov_counts["prod"])
+            self.store.write_build_stat("prov_alt", self.prov_counts["alt"])
+            self.store.write_build_stat("prov_src_rows", self.prov_src_rows)
+            self.store.write_build_stat("prov_comp_rows", self.prov_comp_rows)
+            self.store.write_build_stat("source_rows_total", self.source_rows)
+            for alias, n in self.reduced_rows.items():
+                self.store.write_build_stat(f"reduced_rows:{alias}", n)
+            self.store.write_build_stat("max_physical_table_rows",
+                                        self.max_physical_rows)
+            self.store.write_build_stat("distinct_subtree_factors",
+                                        len(self.memo) + 1)
+            self.c.execute(
+                "INSERT INTO fd_meta VALUES ('root_node_id', ?)", (str(root_id),)
+            )
         return root_id
 
     def _write_node(self, node: BNode) -> int:
+        # 种子化节点：复用旧 node_id，整棵子树（含来源闭包）原样保留，
+        # 不写任何行——干净分区的压缩节点与来源身份因此逐字节延续。
+        if node.persisted_id is not None:
+            self.node_ids[id(node)] = node.persisted_id
+            return node.persisted_id
         key = id(node)
         existing = self.node_ids.get(key)
         if existing is not None:
             return existing
-        nid = len(self.node_ids) + 1
+        nid = self._next_node_id
+        self._next_node_id += 1
         self.node_ids[key] = nid
         self.kind_counts[node.kind] += 1
         scope = ",".join(node.scope)
@@ -998,10 +1044,16 @@ class _Builder:
 
     def _write_prov(self, prov: PNode) -> int:
         """驻留后的来源节点按对象身份分配稳定 id，共享结构只写一份。"""
+        # 惰性引用：直接复用旧版本的 prov_id，不复制其内容
+        if prov.kind == "lazy_ref":
+            assert prov.prov_id is not None
+            self._prov_ids[id(prov)] = prov.prov_id
+            return prov.prov_id
         existing = self._prov_ids.get(id(prov))
         if existing is not None:
             return existing
-        pid = len(self._prov_ids) + 1
+        pid = self._next_prov_id
+        self._next_prov_id += 1
         self._prov_ids[id(prov)] = pid
         self.prov_counts[prov.kind] += 1
         self.c.execute(
