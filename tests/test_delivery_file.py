@@ -146,7 +146,22 @@ class TestDeliveryFile(unittest.TestCase):
         ver = conn.execute(
             "SELECT value FROM fd_meta WHERE key='protocol_version'"
         ).fetchone()[0]
-        self.assertEqual(ver, "1.0")
+        self.assertEqual(ver, "1.1")
+        # 来源追溯协议表齐备且引用完整
+        prov_kinds = {r[0] for r in conn.execute(
+            "SELECT DISTINCT kind FROM fd_prov_node")}
+        self.assertTrue(prov_kinds)
+        bad_prov = conn.execute(
+            "SELECT COUNT(*) FROM fd_prov_comp c "
+            "WHERE NOT EXISTS (SELECT 1 FROM fd_prov_node n "
+            "WHERE n.prov_id = c.child_prov)"
+        ).fetchone()[0]
+        self.assertEqual(bad_prov, 0)
+        # 每个非 empty 因子节点都挂有来源闭包
+        missing = conn.execute(
+            "SELECT COUNT(*) FROM fd_node WHERE kind != 'empty' AND prov_id IS NULL"
+        ).fetchone()[0]
+        self.assertEqual(missing, 0)
         conn.close()
 
 

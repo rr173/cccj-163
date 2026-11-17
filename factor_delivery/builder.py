@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .spec import Spec, Edge
 from .store import DeliveryStore
+from .provenance import PNode, PSrc, ProvFactory
 
 
 class BuildError(RuntimeError):
@@ -35,18 +36,21 @@ class BNode:
     weight: int
     scope: Tuple[str, ...]
     kind: str = "?"
+    # 来源闭包：该因子所有逻辑行的来源表达。empty 节点为 None；
+    # 非空节点在最终闭包计算时由 ProvFactory 驻留赋值。
+    prov: Optional[PNode] = None
 
 
 @dataclass
 class BEmpty(BNode):
     def __init__(self, scope: Tuple[str, ...]):
-        super().__init__(weight=0, scope=scope, kind="empty")
+        super().__init__(weight=0, scope=scope, kind="empty", prov=None)
 
 
 @dataclass
 class BLeaf(BNode):
-    def __init__(self, weight: int):
-        super().__init__(weight=weight, scope=(), kind="leaf")
+    def __init__(self, weight: int, prov: Optional[PNode] = None):
+        super().__init__(weight=weight, scope=(), kind="leaf", prov=prov)
 
 
 # 排序键注册表：构建开始时安装 spec.value_key，使所有 BGroup 在构造/
@@ -107,7 +111,8 @@ class BUnion(BNode):
 
 
 def make_union(children: Sequence[BNode],
-               scope: Optional[Tuple[str, ...]] = None) -> BNode:
+               scope: Optional[Tuple[str, ...]] = None,
+               factory: Optional[ProvFactory] = None) -> BNode:
     """构造袋并节点；空分支剔除，单分支直接返回。"""
     non_empty = [c for c in children if c.kind != "empty"]
     if not non_empty:
@@ -117,13 +122,19 @@ def make_union(children: Sequence[BNode],
     sc = scope if scope is not None else non_empty[0].scope
     weight = sum(c.weight for c in non_empty)
     node = BUnion.__new__(BUnion)
-    BNode.__init__(node, weight=weight, scope=tuple(sc), kind="union")
+    prov = None
+    if factory is not None:
+        provs = [c.prov for c in non_empty if c.prov is not None]
+        if len(provs) == len(non_empty):
+            prov = factory.alt(provs)
+    BNode.__init__(node, weight=weight, scope=tuple(sc), kind="union", prov=prov)
     node.children = non_empty
     return node
 
 
 # --------------------------------------------------------------------- #
-def make_product(children: Sequence[BNode], output_pos: Dict[str, int]) -> BNode:
+def make_product(children: Sequence[BNode], output_pos: Dict[str, int],
+                 factory: Optional[ProvFactory] = None) -> BNode:
     """组合条件独立的分支；空分支传播为空，并校验作用域不重叠且区间连续。"""
     flat: List[BNode] = []
     for ch in children:
@@ -140,20 +151,40 @@ def make_product(children: Sequence[BNode], output_pos: Dict[str, int]) -> BNode
     # 注意 product 展平后可能再次出现空作用域叶子，因此这里统一过滤。
     scoped: List[BNode] = []
     empty_scope_weight = 1
+    empty_scope_prov: List[PNode] = []
     for ch in flat:
         if not ch.scope:
             if ch.kind != "leaf":
                 raise BuildError(f"空作用域因子只能是叶子，得到 {ch.kind}")
             empty_scope_weight *= ch.weight
+            if ch.prov is not None:
+                empty_scope_prov.append(ch.prov)
         else:
             scoped.append(ch)
     if not scoped:
-        # 整个乘积没有任何输出列：退化成一个承载合并重数的叶子
-        return BLeaf(empty_scope_weight)
-    if empty_scope_weight > 1:
-        # 把纯重数缩放作用到第一个有作用域分支（等价于整体 multiplicity 乘积，
-        # 不改变任何列结构或全序）
-        scoped[0] = scale(scoped[0], empty_scope_weight)
+        # 整个乘积没有任何输出列：退化成一个承载合并重数的叶子。
+        # 来源表达 = 各实例来源的连接相乘（无输出列也要逐实例保留身份）。
+        prov = None
+        if factory is not None and empty_scope_prov:
+            prov = factory.prod(empty_scope_prov)
+        return BLeaf(empty_scope_weight, prov)
+    if empty_scope_prov:
+        # 空作用域兄弟（没有输出列的子树，如只含连接键的实例）在乘积中只
+        # 出现一次：把它们的来源表达整体并入 *第一个* 有作用域分支。
+        # 乘进多个分支会让这些来源被重复计数（笛卡尔积语义要求每个因子恰好
+        # 一次）。attach_provenance 信任此处预置的闭包，被折叠实例的身份
+        # 因而不会在重建时丢失。weight = 分支原重数 * factor，属于连接相乘，
+        # 不逐份复制来源节点。
+        extra = factory.prod(empty_scope_prov) if len(empty_scope_prov) > 1 \
+            else empty_scope_prov[0]
+        if extra.weight != empty_scope_weight:
+            raise BuildError("空作用域来源重数与缩放因子不一致")
+        if factory is not None:
+            scoped[0] = scale_with_prov(
+                scoped[0], empty_scope_weight, extra, factory
+            )
+        elif empty_scope_weight > 1:
+            scoped[0] = scale(scoped[0], empty_scope_weight)
     if len(scoped) == 1:
         return scoped[0]
     flat = scoped
@@ -179,7 +210,8 @@ def make_product(children: Sequence[BNode], output_pos: Dict[str, int]) -> BNode
     return BProduct(flat)
 
 
-def union(a: Optional[BNode], b: BNode) -> BNode:
+def union(a: Optional[BNode], b: BNode,
+          factory: Optional[ProvFactory] = None) -> BNode:
     """同作用域的两个因子做袋合并（投影后相同输出元组的重数在此相加）。"""
     if a is None:
         return b
@@ -192,7 +224,8 @@ def union(a: Optional[BNode], b: BNode) -> BNode:
             raise BuildError("合并因子的作用域不一致")
         return a
     if a.kind == "leaf" and b.kind == "leaf":
-        return BLeaf(a.weight + b.weight)
+        prov = _alt_of(a, b, factory)
+        return BLeaf(a.weight + b.weight, prov)
     if a.kind == "group" and b.kind == "group":
         if a.attr != b.attr or a.scope != b.scope:
             raise BuildError("合并 group 的属性/作用域不一致")
@@ -207,7 +240,7 @@ def union(a: Optional[BNode], b: BNode) -> BNode:
         for value, child in b.entries:
             k = _value_identity(value)
             if k in merged:
-                merged[k] = union(merged[k], child)
+                merged[k] = union(merged[k], child, factory)
             else:
                 merged[k] = child
                 value_of[k] = value
@@ -217,12 +250,23 @@ def union(a: Optional[BNode], b: BNode) -> BNode:
     if a.kind == "product" and b.kind == "product":
         if len(a.children) != len(b.children) or a.scope != b.scope:
             raise BuildError("合并 product 的结构不一致")
-        return make_product([union(x, y) for x, y in zip(a.children, b.children)],
-                            _scope_positions(a.scope))
+        return make_product(
+            [union(x, y, factory) for x, y in zip(a.children, b.children)],
+            _scope_positions(a.scope), factory,
+        )
     raise BuildError(f"无法合并不同结构的因子: {a.kind} vs {b.kind}")
 
 
-def union_all(nodes: Sequence[BNode]) -> BNode:
+def _alt_of(a: BNode, b: BNode,
+            factory: Optional[ProvFactory]) -> Optional[PNode]:
+    """两个同构袋并因子的来源表达做 alt（相加）；缺工厂时留给最终闭包计算。"""
+    if factory is None or a.prov is None or b.prov is None:
+        return None
+    return factory.alt([a.prov, b.prov])
+
+
+def union_all(nodes: Sequence[BNode],
+              factory: Optional[ProvFactory] = None) -> BNode:
     """同作用域的多个因子一次性袋并。
 
     分组折叠场景下各因子同构（同 attr/scope），用字典把同值 entry 收集到
@@ -237,14 +281,17 @@ def union_all(nodes: Sequence[BNode]) -> BNode:
     if head.kind == "leaf":
         if any(n.kind != "leaf" for n in non_empty):
             raise BuildError("袋并中 leaf 与非 leaf 混用")
-        return BLeaf(sum(n.weight for n in non_empty))
+        prov = None
+        if factory is not None and all(n.prov is not None for n in non_empty):
+            prov = factory.alt([n.prov for n in non_empty])
+        return BLeaf(sum(n.weight for n in non_empty), prov)
     if head.kind == "group":
         attr = head.attr
         if any(n.kind != "group" or n.attr != attr for n in non_empty):
             # 结构不同构：退化为逐对 union（仅出现在可空前缀等罕见路径）
             acc: Optional[BNode] = None
             for n in nodes:
-                acc = n if acc is None else union(acc, n)
+                acc = n if acc is None else union(acc, n, factory)
             assert acc is not None
             return acc
         buckets: Dict[Tuple[str, Any], List[BNode]] = {}
@@ -255,7 +302,7 @@ def union_all(nodes: Sequence[BNode]) -> BNode:
                 buckets.setdefault(k, []).append(child)
                 value_of[k] = value
         entries = [
-            (value_of[k], union_all(children))
+            (value_of[k], union_all(children, factory))
             for k, children in buckets.items()
         ]
         return BGroup(attr, entries)
@@ -263,15 +310,16 @@ def union_all(nodes: Sequence[BNode]) -> BNode:
         if any(n.kind != "product" for n in non_empty):
             acc = None
             for n in nodes:
-                acc = n if acc is None else union(acc, n)
+                acc = n if acc is None else union(acc, n, factory)
             assert acc is not None
             return acc
         nch = len(head.children)
         if any(len(n.children) != nch for n in non_empty):
             raise BuildError("袋并 product 的分支数不一致")
         return make_product(
-            [union_all([n.children[i] for n in non_empty]) for i in range(nch)],
-            _scope_positions(head.scope),
+            [union_all([n.children[i] for n in non_empty], factory)
+             for i in range(nch)],
+            _scope_positions(head.scope), factory,
         )
     raise BuildError(f"未知节点类型 {head.kind}")
 
@@ -281,11 +329,13 @@ def _scope_positions(scope: Tuple[str, ...]) -> Dict[str, int]:
 
 
 def normalize(node: BNode, target_scope: Tuple[str, ...],
-              output_pos: Dict[str, int]) -> BNode:
+              output_pos: Dict[str, int],
+              factory: Optional[ProvFactory] = None) -> BNode:
     """把因子的 group 嵌套/乘积分支按 target_scope（输出顺序）规范化。
 
     利用分组交换律在条件独立、作用域不重叠的前提下调整嵌套层；
     若目标顺序要求把被同一分组约束的属性与外部属性交错，则抛 BuildError。
+    规范化只重排结构，来源闭包随节点保留（叶子自带、复合节点最终统一计算）。
     """
     if node.kind == "empty":
         return BEmpty(target_scope)
@@ -300,32 +350,34 @@ def normalize(node: BNode, target_scope: Tuple[str, ...],
     if node.kind == "union":
         # 袋并的每个分支同作用域，分别规范化后仍为袋并
         return make_union(
-            [normalize(ch, target_scope, output_pos) for ch in node.children],
-            target_scope,
+            [normalize(ch, target_scope, output_pos, factory)
+             for ch in node.children],
+            target_scope, factory,
         )
     if node.kind == "product":
         # 各分支分别规范化，再按目标顺序排列；分支作用域必须各自构成
         # 目标顺序中的连续区间，否则无法在不展开的前提下保持全序
         rebuilt = [
             normalize(ch, tuple(sorted(ch.scope, key=lambda a: output_pos[a])),
-                      output_pos)
+                      output_pos, factory)
             for ch in node.children
         ]
         rebuilt.sort(key=lambda c: min(output_pos[a] for a in c.scope))
-        return make_product(rebuilt, output_pos)
+        return make_product(rebuilt, output_pos, factory)
     if node.kind == "group":
-        return _normalize_group(node, target_scope, output_pos)
+        return _normalize_group(node, target_scope, output_pos, factory)
     raise BuildError(f"未知节点类型 {node.kind}")
 
 
 def _normalize_group(node: BGroup, target_scope: Tuple[str, ...],
-                     output_pos: Dict[str, int]) -> BNode:
+                     output_pos: Dict[str, int],
+                     factory: Optional[ProvFactory]) -> BNode:
     want_attr = target_scope[0]
     if node.attr == want_attr:
         # 最外层已正确：递归规范化每个子因子到剩余作用域
         rest = target_scope[1:]
         new_entries = [
-            (value, normalize(child, rest, output_pos))
+            (value, normalize(child, rest, output_pos, factory))
             for value, child in node.entries
         ]
         return BGroup(node.attr, new_entries)
@@ -350,8 +402,8 @@ def _normalize_group(node: BGroup, target_scope: Tuple[str, ...],
     new_entries: List[Tuple[Any, BNode]] = []
     for want_value, pairs in lifted.items():
         # 同一 want 值下来自不同分支/外层值的因子是袋并关系
-        inner = make_union([p[1] for p in pairs], rest_scope)
-        inner = normalize(inner, rest_scope, output_pos)
+        inner = make_union([p[1] for p in pairs], rest_scope, factory)
+        inner = normalize(inner, rest_scope, output_pos, factory)
         new_entries.append((want_value, inner))
     return BGroup(want_attr, new_entries)
 
@@ -414,17 +466,50 @@ def _value_identity(value: Any) -> Tuple[str, Any]:
 
 
 def scale(node: BNode, factor: int) -> BNode:
-    """把整棵因子的叶子重数放大 factor 倍（源 multiplicity 的乘积入口）。"""
+    """把整棵因子的叶子重数放大 factor 倍（源 multiplicity 的乘积入口）。
+
+    复制结构、不改动入参节点（入参可能是被记忆化共享的子树）。
+    来源闭包随结构复制保留，最终闭包计算时按新重数交叉核对。
+    """
     if factor == 1 or node.kind == "empty":
         return node
     if node.kind == "leaf":
-        return BLeaf(node.weight * factor)
+        return BLeaf(node.weight * factor, node.prov)
     if node.kind == "group":
         return BGroup(node.attr, [(v, scale(c, factor)) for v, c in node.entries])
     if node.kind == "product":
         return BProduct([scale(c, factor) for c in node.children])
     if node.kind == "union":
         return make_union([scale(c, factor) for c in node.children], node.scope)
+    raise BuildError(f"未知节点类型 {node.kind}")
+
+
+def scale_with_prov(node: BNode, factor: int, extra_prov: PNode,
+                    factory: ProvFactory) -> BNode:
+    """重数放大 factor 倍，并把空作用域兄弟的来源表达 extra_prov 并入每个叶子。
+
+    extra_prov 的 weight 已按 factor 放大（见 make_product）。对叶子：
+    原来源与兄弟来源在同一连接组合中共同贡献 -> prod；重数 = 原重数 * factor。
+    """
+    if node.kind == "leaf":
+        prov = factory.prod([node.prov, extra_prov]) if node.prov is not None \
+            else extra_prov
+        return BLeaf(node.weight * factor, prov)
+    if node.kind == "group":
+        return BGroup(node.attr,
+                      [(v, scale_with_prov(c, factor, extra_prov, factory))
+                       for v, c in node.entries])
+    if node.kind == "product":
+        return BProduct(
+            [scale_with_prov(c, factor, extra_prov, factory)
+             for c in node.children]
+        )
+    if node.kind == "union":
+        return make_union(
+            [scale_with_prov(c, factor, extra_prov, factory)
+             for c in node.children],
+            node.scope, factory,
+        )
     raise BuildError(f"未知节点类型 {node.kind}")
 
 
@@ -438,6 +523,7 @@ def build_factorized(store: DeliveryStore, spec: Spec) -> int:
     _KEY_FN = spec.value_key
     builder = _Builder(store, spec)
     root = builder.run()
+    builder.attach_provenance(root)
     root_id = builder.persist(root)
     store.write_build_stat("root_node_id", root_id)
     store.write_build_stat("logical_total_weight", root.weight)
@@ -452,6 +538,7 @@ class _Builder:
         self.store = store
         self.spec = spec
         self.c = store.conn
+        self.factory = ProvFactory()
         self.output = tuple(spec.output_attrs)
         self.output_pos = {a: i for i, a in enumerate(self.output)}
         # 实例物理信息
@@ -472,6 +559,9 @@ class _Builder:
                            "empty": 0, "union": 0}
         self.group_entry_count = 0
         self.product_child_count = 0
+        self.prov_counts = {"src": 0, "prod": 0, "alt": 0}
+        self.prov_src_rows = 0
+        self.prov_comp_rows = 0
         self.source_rows = 0
         self.reduced_rows: Dict[str, int] = {}
         self.max_physical_rows = 0
@@ -517,9 +607,62 @@ class _Builder:
                 f"根因子作用域 {root.scope} 与输出列 {self.output} 不一致"
             )
         # 按输出列顺序规范化 group 嵌套与乘积分支；不兼容顺序在此抛错
-        root = normalize(root, tuple(self.output), self.output_pos)
+        root = normalize(root, tuple(self.output), self.output_pos, self.factory)
         root.scope = tuple(self.output)
         return root
+
+    # ---------------- 来源闭包 ---------------- #
+    def attach_provenance(self, root: BNode) -> None:
+        """规范化完成后，为整棵因子 DAG 计算并驻留来源闭包。
+
+        叶子的来源在 Trie 装配时已带；复合节点的闭包按结构合成：
+        group/union -> 各孩子 alt（袋并相加），product -> 各孩子 prod（相乘）。
+        全程只遍历因子节点，不枚举任何来源组合。合成后逐节点核对
+        来源 weight 与因子 weight 必须相等。
+        """
+        def closure(node: BNode) -> Optional[PNode]:
+            if node.kind == "empty":
+                node.prov = None
+                return None
+            # 已预置来源闭包的节点直接信任：scale_with_prov 会把空作用域
+            # 兄弟来源并入具体子树（记忆化子树被多个父键上下文复用时，各自
+            # 得到自己的闭包），重算反而会丢掉这些被折叠的实例身份。
+            if node.prov is not None:
+                if node.prov.weight != node.weight:
+                    raise BuildError(
+                        f"预置来源闭包重数 {node.prov.weight} 与因子重数 "
+                        f"{node.weight}（{node.kind}）不符"
+                    )
+                return node.prov
+            if node.kind == "leaf":
+                raise BuildError("非空叶子缺少来源表达")
+            if node.kind == "group":
+                child_provs = [closure(c) for _, c in node.entries]
+                if any(p is None for p in child_provs):
+                    raise BuildError("group 存在无来源表达的非空孩子")
+                prov = self.factory.alt(child_provs)  # type: ignore[arg-type]
+            elif node.kind == "union":
+                child_provs = [closure(c) for c in node.children]
+                if any(p is None for p in child_provs):
+                    raise BuildError("union 存在无来源表达的非空孩子")
+                prov = self.factory.alt(child_provs)  # type: ignore[arg-type]
+            elif node.kind == "product":
+                child_provs = [closure(c) for c in node.children]
+                if any(p is None for p in child_provs):
+                    raise BuildError("product 存在无来源表达的非空孩子")
+                prov = self.factory.prod(child_provs)  # type: ignore[arg-type]
+            else:
+                raise BuildError(f"未知节点类型 {node.kind}")
+            if prov.weight != node.weight:
+                raise BuildError(
+                    f"来源闭包重数 {prov.weight} 与因子重数 {node.weight} "
+                    f"（{node.kind}）不符"
+                )
+            node.prov = prov
+            return prov
+
+        if root.kind != "empty":
+            closure(root)
 
     def _create_reduction_tables(self) -> None:
         for alias, tname in self.spec.instances.items():
@@ -528,8 +671,10 @@ class _Builder:
             red = self.store.create_reduction_table(alias, ncols)
             src = self.store.src_physical(tname)
             cols = ", ".join(f"p{i}" for i in range(ncols))
+            # 连同 row_seq 一起复制：约减只删行，装载序号保持不变
             self.c.execute(
-                f"INSERT INTO {red} ({cols}, mult) SELECT {cols}, mult FROM {src}"
+                f"INSERT INTO {red} (row_seq, {cols}, mult) "
+                f"SELECT row_seq, {cols}, mult FROM {src}"
             )
             cur = self.c.execute(f"SELECT COUNT(*) FROM {src}")
             n = cur.fetchone()[0]
@@ -637,13 +782,13 @@ class _Builder:
         edge = self.parent_edge[alias]
         if edge is None:
             rows = self.c.execute(
-                f"SELECT {select_cols}, mult FROM {red}"
+                f"SELECT row_seq, {select_cols}, mult FROM {red}"
             ).fetchall()
         else:
             key_pos = self._edge_positions(alias, edge)
             conds = " AND ".join(f"p{p} = ?" for p in key_pos)
             rows = self.c.execute(
-                f"SELECT {select_cols}, mult FROM {red} WHERE {conds}",
+                f"SELECT row_seq, {select_cols}, mult FROM {red} WHERE {conds}",
                 parent_key,
             ).fetchall()
 
@@ -664,7 +809,8 @@ class _Builder:
                             and a not in child_key_attrs:
                         child_key_attrs.append(a)
             group_attrs = visible_attrs + child_key_attrs
-            group_pos = [self.pos_of_attr[alias][a] for a in group_attrs]
+            # SELECT row_seq, p0..p{k-1}, mult：物理列值在 row 中的下标 +1
+            group_pos = [self.pos_of_attr[alias][a] + 1 for a in group_attrs]
 
             newly_bound = set(group_attrs)
             child_bound = tuple(set(bound) | newly_bound)
@@ -672,11 +818,12 @@ class _Builder:
             # 一次性 Trie 装配。节点 = {"children": {值身份: 子}, "leaf": 载荷}。
             root_trie: Dict[str, Any] = {"children": {}, "leaf": None}
             for row in rows:
+                row_seq = row[0]
                 mult = row[-1]
-                values = row[:-1]
+                values = row[1:-1]
                 cur = root_trie
                 for phys in group_pos:
-                    val = values[phys]
+                    val = values[phys - 1]
                     kids = cur["children"]
                     key = _value_identity(val)
                     nxt = kids.get(key)
@@ -686,10 +833,12 @@ class _Builder:
                     cur = nxt
                 # 同一 trie 叶子的行在所有分组属性（含子键）上取值相同，
                 # 因此对每个子实例拿到的是同一记忆化因子，只需累加 multiplicity。
+                # 来源行按装载序号登记；值相同但序号不同的行分别保留。
                 if cur["leaf"] is None:
-                    cur["leaf"] = {"w": 0, "by_child": {}}
+                    cur["leaf"] = {"w": 0, "seqs": [], "by_child": {}}
                 payload = cur["leaf"]
                 payload["w"] += mult
+                payload["seqs"].append((row_seq, mult))
                 for child_alias in self.children[alias]:
                     cedge = self.child_edge[(alias, child_alias)]
                     ckey_pos = self._edge_positions(alias, cedge)
@@ -704,9 +853,14 @@ class _Builder:
                     payload["by_child"][child_alias] = cf
 
             def leaf_factor(payload: Dict[str, Any]) -> BNode:
-                factors: List[BNode] = [BLeaf(payload["w"])]
+                # 本实例在该分组取值上的来源行集合（mult 保留为数据，不展开）
+                own = BLeaf(
+                    payload["w"],
+                    self.factory.src(alias, payload["seqs"]),
+                )
+                factors: List[BNode] = [own]
                 factors.extend(payload["by_child"].values())
-                return make_product(factors, self.output_pos)
+                return make_product(factors, self.output_pos, self.factory)
 
             def assemble(trie_node: Dict[str, Any], depth: int) -> BNode:
                 kids = trie_node["children"]
@@ -719,13 +873,17 @@ class _Builder:
                 ]
                 group: BNode = BGroup(attr, entries)
                 if trie_node["leaf"] is not None:  # 前缀终止行（可空列）
-                    group = union_all([group, leaf_factor(trie_node["leaf"])])
+                    group = union_all([group, leaf_factor(trie_node["leaf"])],
+                                      self.factory)
                 return group
 
             if not group_attrs:
-                # 无输出列也无子键：所有行折叠为单个重数叶子
+                # 无输出列也无子键：所有行折叠为单个重数叶子，来源仍是本实例
                 total_w = sum(r[-1] for r in rows)
-                result: BNode = BLeaf(total_w)
+                all_seqs = [(r[0], r[-1]) for r in rows]
+                result: BNode = BLeaf(
+                    total_w, self.factory.src(alias, all_seqs)
+                )
             else:
                 assembled = assemble(root_trie, 0)
                 # 投影：折叠所有非输出的分组属性（内部连接键），做袋并
@@ -761,11 +919,11 @@ class _Builder:
             return node
         if node.kind == "union":
             projected = [self._project_outputs(c) for c in node.children]
-            return make_union(projected, projected[0].scope)
+            return make_union(projected, projected[0].scope, self.factory)
         if node.kind == "product":
             return make_product(
                 [self._project_outputs(c) for c in node.children],
-                self.output_pos,
+                self.output_pos, self.factory,
             )
         if node.kind == "group":
             projected_children = [
@@ -777,12 +935,14 @@ class _Builder:
             return make_union(
                 [c for _, c in projected_children],
                 projected_children[0][1].scope,
+                self.factory,
             )
         raise BuildError(f"未知节点类型 {node.kind}")
 
     # ---------------- 持久化 ---------------- #
     def persist(self, root: BNode) -> int:
         self.store.drop_factor_tables()
+        self._prov_ids: Dict[int, int] = {}
         root_id = self._write_node(root)
         self.store.write_build_stat("node_group", self.kind_counts["group"])
         self.store.write_build_stat("node_product", self.kind_counts["product"])
@@ -791,6 +951,11 @@ class _Builder:
         self.store.write_build_stat("node_empty", self.kind_counts["empty"])
         self.store.write_build_stat("group_entries", self.group_entry_count)
         self.store.write_build_stat("product_children", self.product_child_count)
+        self.store.write_build_stat("prov_src", self.prov_counts["src"])
+        self.store.write_build_stat("prov_prod", self.prov_counts["prod"])
+        self.store.write_build_stat("prov_alt", self.prov_counts["alt"])
+        self.store.write_build_stat("prov_src_rows", self.prov_src_rows)
+        self.store.write_build_stat("prov_comp_rows", self.prov_comp_rows)
         self.store.write_build_stat("source_rows_total", self.source_rows)
         for alias, n in self.reduced_rows.items():
             self.store.write_build_stat(f"reduced_rows:{alias}", n)
@@ -811,9 +976,13 @@ class _Builder:
         self.node_ids[key] = nid
         self.kind_counts[node.kind] += 1
         scope = ",".join(node.scope)
+        prov_id = None
+        if node.prov is not None:
+            prov_id = self._write_prov(node.prov)
         self.c.execute(
-            "INSERT INTO fd_node (node_id, kind, weight, scope) VALUES (?, ?, ?, ?)",
-            (nid, node.kind, str(node.weight), scope),
+            "INSERT INTO fd_node (node_id, kind, weight, scope, prov_id) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (nid, node.kind, str(node.weight), scope, prov_id),
         )
         if node.kind == "group":
             self._write_group(nid, node)
@@ -826,6 +995,39 @@ class _Builder:
                 )
                 self.product_child_count += 1
         return nid
+
+    def _write_prov(self, prov: PNode) -> int:
+        """驻留后的来源节点按对象身份分配稳定 id，共享结构只写一份。"""
+        existing = self._prov_ids.get(id(prov))
+        if existing is not None:
+            return existing
+        pid = len(self._prov_ids) + 1
+        self._prov_ids[id(prov)] = pid
+        self.prov_counts[prov.kind] += 1
+        self.c.execute(
+            "INSERT INTO fd_prov_node (prov_id, kind, weight) VALUES (?, ?, ?)",
+            (pid, prov.kind, str(prov.weight)),
+        )
+        if prov.kind == "src":
+            assert isinstance(prov, PSrc)
+            for pos, (row_seq, mult) in enumerate(prov.rows):
+                self.c.execute(
+                    "INSERT INTO fd_prov_src "
+                    "(prov_id, alias, row_seq, mult, position) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (pid, prov.alias, row_seq, mult, pos),
+                )
+                self.prov_src_rows += 1
+        else:
+            for pos, child in enumerate(prov.children):
+                cid = self._write_prov(child)
+                self.c.execute(
+                    "INSERT INTO fd_prov_comp "
+                    "(prov_id, position, child_prov) VALUES (?, ?, ?)",
+                    (pid, pos, cid),
+                )
+                self.prov_comp_rows += 1
+        return pid
 
     def _write_group(self, nid: int, node: BGroup) -> None:
         # 统一按规格定义的全序排序：NULL 最先，然后数值/码点/false<true。

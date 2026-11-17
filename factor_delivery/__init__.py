@@ -13,9 +13,11 @@ SQLite，重开文件后无需原始来源即可：
 from .spec import Column, Table, Edge, Spec, SpecError
 from .builder import build_factorized, BuildError
 from .store import DeliveryStore, ProtocolError
-from .query import QuerySession, Condition
+from .query import QuerySession, Condition, QueryError
+from .lineage import LineageExpression, LineageNode, lineage_of
 from .reference import (
     brute_force_join, brute_force_count, brute_force_page, brute_force_filtered,
+    brute_force_lineage, lineage_participating_rows,
 )
 
 __all__ = [
@@ -30,8 +32,14 @@ __all__ = [
     "ProtocolError",
     "QuerySession",
     "Condition",
+    "QueryError",
+    "LineageExpression",
+    "LineageNode",
+    "lineage_of",
     "brute_force_join",
     "brute_force_count",
     "brute_force_page",
     "brute_force_filtered",
+    "brute_force_lineage",
+    "lineage_participating_rows",
 ]

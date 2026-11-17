@@ -144,3 +144,101 @@ def brute_force_filtered(
         if good:
             kept.append((tup, mult))
     return kept
+
+
+# --------------------------------------------------------------------- #
+# 独立来源追溯枚举器：与 factor_delivery.lineage 完全不共享任何代码，
+# 逐行嵌套循环枚举每一个 *来源组合*，供小材料核对来源表达用。
+# --------------------------------------------------------------------- #
+def brute_force_lineage(spec: Spec) -> Dict[
+    Tuple[Any, ...], Dict[Tuple[Tuple[str, int], ...], int]
+]:
+    """返回 {输出元组: {来源组合(按实例别名排序的 (别名, row_seq) 元组): 权重}}。
+
+    每个来源组合的权重 = 组合内各来源行 multiplicity 的乘积；
+    投影后同一输出元组的多个组合分别保留（键不同即不同组合），
+    组合权重之和等于该元组在结果袋中的重数。
+    """
+    spec.validate()
+    root = spec.root_alias()
+    parent: Dict[str, str] = {}
+    parent_edge: Dict[str, Any] = {}
+    stack = [root]
+    seen = {root}
+    order: List[str] = [root]
+    while stack:
+        u = stack.pop()
+        for v, edge in spec.adj[u]:
+            if v in seen:
+                continue
+            seen.add(v)
+            parent[v] = u
+            parent_edge[v] = edge
+            stack.append(v)
+            order.append(v)
+
+    # 每个实例的 (取值元组, 装载序号, multiplicity)；序号即 Table.rows 的下标
+    rows_of: Dict[str, List[Tuple[Tuple[Any, ...], int, int]]] = {}
+    attr_pos: Dict[str, Dict[str, int]] = {}
+    for alias, tname in spec.instances.items():
+        tbl = spec.tables[tname]
+        rows_of[alias] = [
+            (tuple(r), seq, mult)
+            for seq, (r, mult) in enumerate(zip(tbl.rows, tbl.multiplicities))
+        ]
+        attr_pos[alias] = {col.attr: i for i, col in enumerate(tbl.columns)}
+
+    bag: Dict[Tuple[Any, ...], Dict[Tuple[Tuple[str, int], ...], int]] = {}
+    choices = [rows_of[a] for a in order]
+    for combo in cartesian(*choices):
+        assigned: Dict[str, Tuple[Any, ...]] = {}
+        weight = 1
+        ok = True
+        for alias, (vals, _seq, mult) in zip(order, combo):
+            if alias != root:
+                edge = parent_edge[alias]
+                p = parent[alias]
+                pvals = assigned[p]
+                for cl, cr in zip(edge.cols_left, edge.cols_right):
+                    if edge.alias_left == alias:
+                        a_col, p_col = cl, cr
+                    else:
+                        a_col, p_col = cr, cl
+                    a_attr = spec.tables[spec.instances[alias]].col(a_col).attr
+                    p_attr = spec.tables[spec.instances[p]].col(p_col).attr
+                    x = vals[attr_pos[alias][a_attr]]
+                    y = pvals[attr_pos[p][p_attr]]
+                    if x is None or y is None or x != y:  # null 不匹配
+                        ok = False
+                        break
+                if not ok:
+                    break
+            assigned[alias] = vals
+            weight *= mult
+        if not ok:
+            continue
+        out = tuple(
+            _first_value(spec, assigned, attr_pos, attr)
+            for attr in spec.output_attrs
+        )
+        # 来源组合身份：按别名排序的 (实例, 来源行序号)。同值不同序号是
+        # 不同组合；multiplicity 只作为权重，绝不逐份展开。
+        combo_key = tuple(sorted(
+            (alias, seq) for alias, (_v, seq, _m) in zip(order, combo)
+        ))
+        bag.setdefault(out, {})
+        bag[out][combo_key] = bag[out].get(combo_key, 0) + weight
+    return bag
+
+
+def lineage_participating_rows(
+    enum: Dict[Tuple[Any, ...], Dict[Tuple[Tuple[str, int], ...], int]],
+    tuple_value: Tuple[Any, ...], alias: str,
+) -> Dict[int, int]:
+    """从枚举结果求某实例上参与该元组的 {row_seq: 组合权重合计}。"""
+    out: Dict[int, int] = {}
+    for combo, weight in enum.get(tuple_value, {}).items():
+        for a, seq in combo:
+            if a == alias:
+                out[seq] = out.get(seq, 0) + weight
+    return out

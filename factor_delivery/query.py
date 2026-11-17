@@ -750,6 +750,25 @@ class QuerySession:
         factor = self.root.restrict(conds)
         return RestrictedView(self, factor, list(conds.values()))
 
+    # ---------------- 来源追溯 ---------------- #
+    def lineage(self, tuple_value: Any):
+        """返回完整输出元组的来源表达（LineageExpression）。
+
+        不存在的输出元组得到根为 None 的空表达（exists() 为 False）；
+        类型错误或值不属于输出列时抛 QueryError。惰性导入 lineage 模块，
+        避免查询层与追溯层循环依赖。
+        """
+        from .lineage import lineage_of
+        return lineage_of(self, tuple_value)
+
+    def source_row(self, alias: str, row_seq: int):
+        """按装载序号取实例来源行（供审计核对），序号越界返回 None。"""
+        return self.store.fetch_source_row(alias, row_seq)
+
+    def source_row_count(self, alias: str) -> int:
+        """实例来源表的装载行数（来源行序号空间 0..n-1）。"""
+        return self.store.source_row_count(alias)
+
     def _validate_conditions(
         self, conditions: Sequence[Condition]
     ) -> Dict[str, Condition]:

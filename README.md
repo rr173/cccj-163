@@ -7,7 +7,10 @@
 - `page(r, n)`：按输出全序读取从秩 `r` 开始的 `n` 行（秩从 0 开始，
   重复元组各占一个秩，`r` 越界返回空，`n=0` 不枚举）；
 - `restricted(conds)`：在输出列上做等值 / is_null 筛选，**在结果语义上
-  重新计算连续秩**，而不是从未筛选的秩处截取。
+  重新计算连续秩**，而不是从未筛选的秩处截取；
+- `lineage(tuple)`：给定一条完整输出元组，返回紧凑**来源表达**，指出参与
+  连接的各表实例及输入行序号，可浏览表达节点、计算来源组合数、判断指定
+  实例行是否参与——全程不枚举来源组合。
 
 建立结构与查询都**不会逐行走过完整逻辑输出**：4 亿组合行只产生随源表 /
 键分组增长的节点，文件里没有宽连接结果。
@@ -43,12 +46,71 @@ with DeliveryStore.open("delivery.db") as store:
     v.page(0, 10)
 ```
 
+## 来源追溯（lineage）
+
+`lineage(完整输出元组)` 返回一个 `LineageExpression`。它沿因子 DAG 中与
+元组取值匹配的分组下行，只访问相关节点，**不枚举来源组合**：一条元组即使
+有上亿种来源组合，表达节点数也只随来源行与因子结构增长。
+
+```python
+with DeliveryStore.open("delivery.db") as store:
+    sess = QuerySession(store)
+    expr = sess.lineage(("d", "a", "x"))
+
+    expr.exists()                 # 不存在的输出元组返回 False（不报错）
+    expr.combination_count()      # 来源组合数 == 该元组在结果袋中的重数
+    expr.node_count()             # 表达节点数（有界，不随组合数增长）
+    expr.nodes()                  # 浏览全部表达节点（DFS 去重）
+    expr.source_refs()            # [(实例别名, row_seq, multiplicity), ...]
+    expr.participates("l", 0)     # 实例 l 的第 0 个输入行是否参与该元组
+    print(expr.to_text())         # 人类可读的来源树
+
+    # 按实例 + 装载序号直接审计来源行（值与 mult，bool 已还原）
+    sess.source_row("l", 0)       # {'row_seq':0, 'mult':1, 'values':{...}}
+    sess.source_row_count("l")    # 实例 l 的来源行序号空间 0..n-1
+```
+
+### 来源表达节点的含义
+
+来源表达是一棵 `src` / `prod` / `alt` 组成的 DAG，持久化在
+`fd_prov_node` / `fd_prov_src` / `fd_prov_comp` 中。节点 `node_id > 0`
+可直接在 SQLite 文件里按 id 审查；`node_id < 0` 是本次查询在内存中合成的
+包装节点（对持久化节点做 prod/alt），不写入文件。
+
+| kind | 含义 | 组合数（weight） |
+|------|------|------------------|
+| `src` | 某表**实例**（角色别名）上的一组来源行，rows 为 `(row_seq, mult)`；`mult` 是该行代表的重复次数，作为数据保留、不逐份建节点 | 各行 mult 之和 |
+| `prod` | 连接相乘：各分支在**同一组合**中共同贡献 | 各孩子 weight 之积 |
+| `alt` | 袋并相加：投影后多个**互斥**连接分支都能得到该元组 | 各孩子 weight 之和 |
+
+关键语义保证：
+
+1. **输入行序号按来源表装载顺序确定**（从 0 起，存于 src/red 表的
+   `row_seq`）。值完全相同、序号不同的行仍是不同来源行，分别保留。
+2. **同一来源表被多个实例引用时身份独立**：每个角色别名有自己的 `src`
+   节点，互不混淆。
+3. **multiplicity 不展开**：一行 multiplicity=N 在 `src` 节点里只是一行
+   `(row_seq, N)`，来源组合数经 weight 精确计入，绝不制造 N 个节点。
+4. **不同连接键分组不交叉**：投影折叠连接键时用 `alt` 保留各父键分支，
+   `(a×b) ∪ (c×d)` 不会被改写成 `(a∪c)×(b∪d)`。
+5. **来源组合数与结果重数一致**：导航时独立沿因子路径重算该元组重数，
+   并与表达根 weight、各节点缓存 weight 交叉核对，篡改任一层都会被检出。
+
+错误约定：输出元组列数不符、值的类型与输出列声明不一致（如 int64 列传
+字符串、bool 列传整数）、向不可空列传 NULL，均抛 `QueryError`；不存在的
+输出元组得到根为 `None` 的空表达（`exists()` 为 `False`，组合数 0）。
+`participates` 的别名未知或序号类型非法抛 `QueryError`，序号越界返回
+`False`。`count()` / `page()` / `restricted()` 的语义保持不变。
+
 ## 因子节点协议（可审查的节点表）
 
 所有因子节点保存在 `fd_node`，明细在 `fd_group_entry` /
-`fd_product_child`。每个节点都带 `weight`（缓存重数）与 `scope`（作用域
-逻辑属性，按输出顺序）。查询时每个节点的重数都从子节点**自底向上重算**
-并与缓存值交叉核对，绝不只信一个总行数字段。
+`fd_product_child`。每个节点都带 `weight`（缓存重数）、`scope`（作用域
+逻辑属性，按输出顺序）与 `prov_id`（来源闭包，empty 节点为 NULL）。
+查询时每个节点的重数都从子节点**自底向上重算**并与缓存值交叉核对，
+绝不只信一个总行数字段。来源表达单独保存在 `fd_prov_node` /
+`fd_prov_src` / `fd_prov_comp`，见上一节「来源表达节点的含义」。
+来源表与约减表都带 `row_seq`（来源行装载序号，约减只删行不重排）。
 
 | kind    | 行域（domain）                          | 计数（weight）                     | 组合意义 |
 |---------|----------------------------------------|------------------------------------|----------|
@@ -90,8 +152,15 @@ with DeliveryStore.open("delivery.db") as store:
   枚举的完整袋及每个秩对比；
 - `python3 -I tests/test_randomized.py`：随机小树 / 数据 / 投影顺序 /
   条件的属性测试；
+- `python3 -I tests/test_lineage.py`：来源追溯专项。用两套独立实现互校——
+  逐行枚举每个来源组合的 `brute_force_lineage`，与对紧凑表达的独立展开器
+  `expand_expression`；覆盖 multiplicity、同值异序行、同表多实例身份、
+  投影 alt 不交叉、多键分组隔离、空结果、类型/列错误、新进程重开等；
 - `python3 -I tests/demo_scale.py`：20000×20000=4 亿行主演练，记录节点数、
-  文件大小、SQL 访问计数，并验证除余定位、d2 隔离、投影重数相加。
+  文件大小、SQL 访问计数，并验证除余定位、d2 隔离、投影重数相加；
+- `python3 -I tests/demo_lineage_scale.py`：单条输出元组承载 **12.25 亿**
+  来源组合，表达仅 9 个节点；验证节点有界、参与查询不展开（个位数 SQL）、
+  多键分组 alt 不交叉、新进程重开可追溯，并用小样本独立枚举器逐组合核对。
 
 ## 明确不支持
 

@@ -9,13 +9,18 @@ fd_instance         表实例（角色别名 -> 来源表；同一来源可承�
 fd_instance_column  实例列定义及在来源表中的物理位置
 fd_edge             连接边（边号、端点、左右位置、键列、逻辑属性）
 fd_output_attr      输出列的逻辑属性与定义顺序
-fd_node             因子节点：kind ∈ group/product/leaf/empty，缓存重数、作用域
+fd_node             因子节点：kind ∈ group/product/leaf/empty/union，缓存重数、作用域、
+                    来源闭包 prov_id（empty 节点为 NULL）
 fd_group_entry      group 节点的排序值域（每行一个取值及其子节点）
-fd_product_child    product 节点的不重叠分支（按输出顺序排列）
+fd_product_child    product/union 节点的分支（按输出顺序 / 袋并次序）
+fd_prov_node        来源表达节点：kind ∈ src/prod/alt，缓存来源组合数（weight）
+fd_prov_src         src 节点的来源行清单（实例别名、输入行序号、该行 multiplicity）
+fd_prov_comp        prod/alt 节点的子来源节点（op 标明相乘还是袋并）
 fd_build_stat       构建统计（节点数、各表行数、SQL 语句数等）
 
 源表物理名 src_<i>，约减表物理名 red_<alias 编号>，均只保存 *存活* 元组，
-绝不保存完整宽连接结果。
+绝不保存完整宽连接结果。两张表都带 row_seq：来源行按装载顺序编号（从 0 起），
+同一张表被多个实例引用时各自保留独立身份；值完全相同的行序号不同、仍是不同来源行。
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .spec import Spec
 
-PROTOCOL_VERSION = "1.0"
+PROTOCOL_VERSION = "1.1"
 
 
 class ProtocolError(RuntimeError):
@@ -115,7 +120,8 @@ CREATE TABLE fd_node (
     node_id INTEGER PRIMARY KEY,
     kind    TEXT NOT NULL CHECK (kind IN ('group', 'product', 'leaf', 'empty', 'union')),
     weight  TEXT NOT NULL,
-    scope   TEXT NOT NULL
+    scope   TEXT NOT NULL,
+    prov_id INTEGER
 );
 CREATE TABLE fd_group_entry (
     node_id    INTEGER NOT NULL,
@@ -135,6 +141,32 @@ CREATE TABLE fd_product_child (
     child_id INTEGER NOT NULL,
     PRIMARY KEY (node_id, position)
 );
+-- 来源追溯（lineage / provenance）：紧凑来源表达 DAG。
+-- src：某个表实例上的一组来源行（行序号 + 该行 multiplicity，不逐份展开）；
+-- prod：各分支共同贡献，来源组合数相乘（同一连接组合内的各来源）；
+-- alt：袋并，来源组合数相加（投影后多个连接分支得到同一输出元组，
+--       不同连接键分组的来源在此保持互不交叉）。
+CREATE TABLE fd_prov_node (
+    prov_id INTEGER PRIMARY KEY,
+    kind    TEXT NOT NULL CHECK (kind IN ('src', 'prod', 'alt')),
+    weight  TEXT NOT NULL
+);
+CREATE TABLE fd_prov_src (
+    prov_id  INTEGER NOT NULL,
+    alias    TEXT NOT NULL,
+    row_seq  INTEGER NOT NULL,
+    mult     INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (prov_id, position)
+);
+CREATE INDEX idx_prov_src_lookup ON fd_prov_src(alias, row_seq);
+CREATE TABLE fd_prov_comp (
+    prov_id     INTEGER NOT NULL,
+    position    INTEGER NOT NULL,
+    child_prov  INTEGER NOT NULL,
+    PRIMARY KEY (prov_id, position)
+);
+CREATE INDEX idx_prov_comp_child ON fd_prov_comp(child_prov);
 CREATE TABLE fd_build_stat (
     metric TEXT PRIMARY KEY,
     value  TEXT NOT NULL
@@ -151,6 +183,8 @@ class DeliveryStore:
         self._owns = owns
         self._output_attrs: Optional[List[Tuple[str, str, bool]]] = None
         self._attr_meta: Optional[Dict[str, Tuple[str, bool]]] = None
+        self._instances: Optional[Dict[str, str]] = None
+        self._instance_dtypes: Optional[Dict[str, List[Tuple[str, str, bool]]]] = None
 
     # ------------------------------------------------------------------ #
     @classmethod
@@ -198,6 +232,11 @@ class DeliveryStore:
         row = cur.fetchone()
         if row is None or row[0] != PROTOCOL_VERSION:
             raise ProtocolError("协议版本缺失或不受支持")
+        cur = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='fd_prov_node'"
+        )
+        if cur.fetchone() is None:
+            raise ProtocolError("交付文件缺少来源追溯表 fd_prov_node")
 
     def _load_meta(self) -> None:
         cur = self.conn.execute(
@@ -206,6 +245,66 @@ class DeliveryStore:
         self._output_attrs = [(a, t, bool(n)) for a, t, n in cur.fetchall()]
         self._attr_meta = {a: (t, n) for a, t, n in self._output_attrs}
         # 条件里允许出现的属性只需是输出属性；条件只能筛选输出列。
+        # 来源追溯需要实例身份与来源表映射，重开后从协议表恢复。
+        cur = self.conn.execute("SELECT alias, table_name FROM fd_instance")
+        self._instances = {alias: tname for alias, tname in cur.fetchall()}
+        self._instance_dtypes = {}
+        for alias in self._instances:
+            cur = self.conn.execute(
+                "SELECT col_name, dtype, nullable FROM fd_instance_column "
+                "WHERE alias=? ORDER BY position",
+                (alias,),
+            )
+            self._instance_dtypes[alias] = [
+                (name, dtype, bool(nullable)) for name, dtype, nullable in cur.fetchall()
+            ]
+
+    @property
+    def instances(self) -> Dict[str, str]:
+        """实例别名 -> 来源表名（同一来源表可被多个实例分别引用）。"""
+        assert self._instances is not None
+        return dict(self._instances)
+
+    def instance_columns(self, alias: str) -> List[Tuple[str, str, bool]]:
+        """实例各列的 (列名, 声明类型, 是否可空)，按来源表装载位置排列。"""
+        assert self._instance_dtypes is not None
+        if alias not in self._instance_dtypes:
+            raise ProtocolError(f"未知表实例 {alias!r}")
+        return list(self._instance_dtypes[alias])
+
+    def source_row_count(self, alias: str) -> int:
+        """实例来源表按装载顺序的总行数（序号空间为 0..n-1）。"""
+        assert self._instances is not None
+        if alias not in self._instances:
+            raise ProtocolError(f"未知表实例 {alias!r}")
+        phys = self.src_physical(self._instances[alias])
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM {phys}"
+        ).fetchone()[0]
+
+    def fetch_source_row(self, alias: str, row_seq: int) -> Optional[Dict[str, Any]]:
+        """按装载序号取一条来源行（含 mult 与各列值，bool 已还原为 Python bool）。
+
+        序号越界返回 None，便于审计者直接核对 fd_prov_src 里登记的来源。
+        """
+        assert self._instances is not None and self._instance_dtypes is not None
+        if alias not in self._instances:
+            raise ProtocolError(f"未知表实例 {alias!r}")
+        if not isinstance(row_seq, int) or isinstance(row_seq, bool) or row_seq < 0:
+            raise ProtocolError("row_seq 必须是非负整数")
+        cols = self._instance_dtypes[alias]
+        phys = self.src_physical(self._instances[alias])
+        select = ", ".join(["row_seq", "mult"] + [f"p{i}" for i in range(len(cols))])
+        row = self.conn.execute(
+            f"SELECT {select} FROM {phys} WHERE row_seq=?", (row_seq,)
+        ).fetchone()
+        if row is None:
+            return None
+        values = {}
+        for i, (name, dtype, _nullable) in enumerate(cols):
+            raw = row[2 + i]
+            values[name] = bool(raw) if dtype == "bool" and raw is not None else raw
+        return {"row_seq": row[0], "mult": row[1], "values": values}
 
     @property
     def output_attrs(self) -> List[Tuple[str, str, bool]]:
@@ -238,11 +337,16 @@ class DeliveryStore:
             col_defs = ", ".join(
                 f"p{pos} {_sqlite_type(col.dtype)}" for pos, col in enumerate(tbl.columns)
             )
-            c.execute(f"CREATE TABLE {phys} ({col_defs}, mult INTEGER NOT NULL)")
-            params = [(*row, mult) for row, mult in
-                      zip(tbl.rows, tbl.multiplicities)]
+            # row_seq：来源行装载序号（从 0 起），来源追溯以此命名来源行
+            c.execute(
+                f"CREATE TABLE {phys} (row_seq INTEGER NOT NULL, {col_defs}, "
+                "mult INTEGER NOT NULL, PRIMARY KEY (row_seq))"
+            )
+            params = [(i, *row, mult) for i, (row, mult) in
+                      enumerate(zip(tbl.rows, tbl.multiplicities))]
             c.executemany(
-                f"INSERT INTO {phys} VALUES ({','.join('?' * (len(tbl.columns) + 1))})",
+                f"INSERT INTO {phys} VALUES "
+                f"({','.join('?' * (len(tbl.columns) + 2))})",
                 params,
             )
 
@@ -293,8 +397,10 @@ class DeliveryStore:
     def create_reduction_table(self, alias: str, ncols: int) -> str:
         phys = self.red_physical(alias)
         col_defs = ", ".join(f"p{i}" for i in range(ncols))
+        # 保留来源行装载序号 row_seq：约减只删行、不重排，序号始终指向 src 表
         self.conn.execute(
-            f"CREATE TABLE {phys} ({col_defs}, mult INTEGER NOT NULL)"
+            f"CREATE TABLE {phys} (row_seq INTEGER NOT NULL, {col_defs}, "
+            "mult INTEGER NOT NULL, PRIMARY KEY (row_seq))"
         )
         return phys
 
@@ -302,6 +408,9 @@ class DeliveryStore:
         self.conn.execute("DELETE FROM fd_node")
         self.conn.execute("DELETE FROM fd_group_entry")
         self.conn.execute("DELETE FROM fd_product_child")
+        self.conn.execute("DELETE FROM fd_prov_node")
+        self.conn.execute("DELETE FROM fd_prov_src")
+        self.conn.execute("DELETE FROM fd_prov_comp")
         self.conn.execute("DELETE FROM fd_build_stat")
 
     def write_build_stat(self, metric: str, value: Any) -> None:
